@@ -1,11 +1,19 @@
+import logging
 import functools
 import numpy as np
 import operator
+import warnings
 import copy
+import time 
 
-from . import dn, d3, ease
+import scipy
+from scipy.linalg import LinAlgWarning
+
+from . import dn, d3, ease, errors, util
 
 # Constants
+
+logger = logging.getLogger(__name__)    
 
 ORIGIN = np.array((0, 0))
 
@@ -45,6 +53,310 @@ class SDF2:
         newSelf = copy.deepcopy(self)
         newSelf._k = k
         return newSelf
+    
+    @errors.alpha_quality
+    def closest_surface_point(self, point):
+        def distance(p):
+            # root() wants same input/output dims (yeah...)
+            return np.repeat(self.f(np.expand_dims(p, axis=0)).ravel()[0], 2)
+
+        dist = self.f(np.expand_dims(point, axis=0)).ravel()[0]
+        optima = dict()
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", (LinAlgWarning, RuntimeWarning, UserWarning)
+            )
+            for method in (
+                # loosely sorted by speed
+                "lm",
+                "broyden2",
+                "df-sane",
+                "hybr",
+                "broyden1",
+                "anderson",
+                "linearmixing",
+                "diagbroyden",
+                "excitingmixing",
+                "krylov",
+            ):
+                try:
+                    optima[method] = (
+                        opt := scipy.optimize.root(
+                            distance, x0=np.array(point), method=method
+                        )
+                    )
+                except Exception as e:
+                    pass
+                opt.zero_error = abs(opt.fun[0])
+                opt.zero_error_rel = opt.zero_error / dist
+                opt.dist_error = np.linalg.norm(opt.x - point) - dist
+                opt.dist_error_rel = opt.dist_error / dist
+                logger.debug(f"{method = }, {opt = }")
+                # shortcut if fit is good
+                if (
+                    np.allclose(opt.fun, 0)
+                    and abs(opt.dist_error / dist - 1) < 0.01
+                    and opt.dist_error < 0.01
+                ):
+                    break
+
+            def cost(m):
+                penalty = (
+                    # unsuccessfulness is penaltied
+                    (not optima[m].success)
+                    # a higher status normally means something bad
+                    + abs(getattr(optima[m], "status", 1))
+                    # the more we're away from zero, the worse it is
+                    # „1mm of away from boundary is as bad as one status or success step”
+                    + optima[m].zero_error
+                    # the distance error can be quite large e.g. for non-uniform scaling,
+                    # and methods often find weird points, it makes sense to compare to the SDF
+                    + optima[m].dist_error
+                )
+                logger.debug(f"{m = :20s}: {penalty = }")
+                return penalty
+
+            best_root = optima[best_method := min(optima, key=cost)]
+            closest_point = best_root.x
+            if (
+                best_root.zero_error > 1
+                or best_root.zero_error_rel > 0.01
+                or best_root.dist_error > 1
+                or best_root.dist_error_rel > 0.01
+            ):
+                warnings.warn(
+                    f"Closest surface point to {point} acc. to method {best_method!r} seems to be {closest_point}. "
+                    f"The SDF there is {best_root.fun[0]} (should be 0, that's {best_root.zero_error} or {best_root.zero_error_rel*100:.2f}% off).\n"
+                    f"Distance between {closest_point} and {point} is {np.linalg.norm(point - closest_point)}, "
+                    f"SDF says it should be {dist} (that's {best_root.dist_error} or {best_root.dist_error_rel*100:.2f}% off)).\n"
+                    f"The root finding algorithms seem to have a problem with your SDF, "
+                    f"this might be caused due to operations breaking the metric like non-uniform scaling.",
+                    errors.SDFCADWarning,
+                )
+        return closest_point
+
+    @errors.alpha_quality
+    def surface_intersection(self, start, direction=None):
+        """
+        ``start`` at a point, move (back or forth) along a line following a
+        ``direction`` and return surface intersection coordinates.
+
+        .. note::
+
+            In case there is no intersection, the result *might* (not sure
+            about that) return the point on the line that's closest to the
+            surface 🤔.
+
+        Args:
+            start (2d vector): starting point
+            direction (2d vector or None): direction to move into, defaults to
+            ``-start`` (”move to origin”).
+
+        Returns:
+            2d vector: the optimized surface intersection
+        """
+        if direction is None:
+            direction = -start
+
+        def transform(t):
+            return start + t * direction
+
+        def distance(t):
+            # root() wants same input/output dims (yeah...)
+            return np.repeat(self.f(np.expand_dims(transform(t), axis=0)).ravel()[0], 3)
+            # return self.f(np.expand_dims(transform(t), axis=0)).ravel()[0]
+
+        dist = self.f(np.expand_dims(start, axis=0)).ravel()[0]
+        optima = dict()
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", (LinAlgWarning, RuntimeWarning, UserWarning)
+            )
+            for method in (
+                # loosely sorted by speed
+                "lm",
+                "broyden2",
+                "df-sane",
+                "hybr",
+                "broyden1",
+                "anderson",
+                "linearmixing",
+                "diagbroyden",
+                "excitingmixing",
+                "krylov",
+            ):
+                try:
+                    optima[method] = (
+                        opt := scipy.optimize.root(distance, x0=[0], method=method)
+                    )
+                except Exception as e:
+                    pass
+                opt.zero_error = abs(opt.fun[0])
+                opt.zero_error_rel = opt.zero_error / dist
+                opt.point = transform(opt.x[0])
+                logger.debug(f"{method = }, {opt = }")
+                # shortcut if fit is good
+                if np.allclose(opt.fun, 0):
+                    break
+
+            def cost(m):
+                penalty = (
+                    # unsuccessfulness is penaltied
+                    (not optima[m].success)
+                    # a higher status normally means something bad
+                    + abs(getattr(optima[m], "status", 1))
+                    # the more we're away from zero, the worse it is
+                    # „1mm of away from boundary is as bad as one status or success step”
+                    + optima[m].zero_error
+                )
+                logger.debug(f"{m = :20s}: {penalty = }")
+                return penalty
+
+            best_root = optima[best_method := min(optima, key=cost)]
+            closest_point = transform(best_root.x[0])
+            if best_root.zero_error > 1 or best_root.zero_error_rel > 0.01:
+                warnings.warn(
+                    f"Surface intersection point from {start = } to {direction = }, acc. to method {best_method!r} seems to be {closest_point}. "
+                    f"The SDF there is {best_root.fun[0]} (should be 0, that's {best_root.zero_error} or {best_root.zero_error_rel*100:.2f}% off).\n"
+                    f"The root finding algorithms seem to have a problem with your SDF, "
+                    f"this might be caused due to operations breaking the metric like non-uniform scaling "
+                    f"or just because there is no intersection...",
+                    errors.SDFCADWarning,
+                )
+        return closest_point
+
+    @errors.alpha_quality
+    def minimum_sdf_on_plane(self, origin, normal, return_point=False):
+        """
+        Find the minimum SDF distance (not necessarily the real distance if you
+        have non-uniform scaling!) on a plane around an ``origin`` that points
+        into the ``normal`` direction.
+
+        Args:
+            origin (2d vector): a point on the plane
+            normal (2d vector): normal vector of the plane
+            return_point (bool): whether to also return the closest point (on
+                the plane!)
+
+        Returns:
+            float: the (minimum) distance to the plane
+            float, 2d vector : distance and closest point (on the plane!) if
+                ``return_point=True``
+        """
+        basemat = np.array(
+            (e1 := _perpendicular(normal))
+        )
+
+        def transform(t):
+            return origin + basemat * t
+
+        def distance(t):
+            return self.f(np.expand_dims(transform(t), axis=0)).ravel()[0]
+
+        optima = dict()
+        with warnings.catch_warnings():
+            warnings.simplefilter(
+                "ignore", (LinAlgWarning, RuntimeWarning, UserWarning)
+            )
+            for method in (
+                "Nelder-Mead",
+                "Powell",
+                "CG",
+                "BFGS",
+                "L-BFGS-B",
+                "TNC",
+                "COBYLA",
+                "SLSQP",
+                "trust-constr",
+            ):
+                try:
+                    optima[method] = (
+                        opt := scipy.optimize.minimize(
+                            distance, x0=0, method=method
+                        )
+                    )
+                    opt.point = transform(opt.x[0])
+                    logger.debug(f"{method = }, {opt = }")
+                except Exception as e:
+                    logger.error(f"{method = } error {e!r}")
+
+        best_min = optima[min(optima, key=lambda m: optima[m].fun)]
+        if return_point:
+            return best_min.fun, best_min.point
+        else:
+            return best_min.fun
+
+    @errors.alpha_quality
+    def extent_in(self, direction):
+        """
+        Determine the largest distance from the origin in a given ``direction``
+        that's still within the object.
+
+        Args:
+            direction (3d vector): the direction to check
+
+        Returns:
+            float: distance from origin
+        """
+        # create probing points along direction to check where object ends roughly
+        # object ends when SDF is only increasing (not the case for infinite repetitions e.g.)
+        probing_points = np.expand_dims(np.logspace(-5, 9, 30), axis=1) * direction
+        d = self.f(probing_points)  # get SDF value at probing points
+        n_trailing_ascending = util.n_trailing_ascending_positive(d)
+        if not n_trailing_ascending:
+            return np.inf
+        if (ratio := n_trailing_ascending / d.size) < 0.5:
+            warnings.warn(
+                f"extent_in({direction = !r}): "
+                f"Only {n_trailing_ascending}/{d.size} ({ratio*100:.1f}%) of probed points in "
+                f"{direction = } have ascending positive SDF distance values. "
+                f"This can be caused by infinite objects. "
+                f"Result of might be wrong. ",
+                errors.SDFCADWarning,
+            )
+        faraway = probing_points[
+            -n_trailing_ascending + 1
+        ]  # choose first point after which SDF only increases
+        closest_surface_point = self.closest_surface_point_to_plane(
+            origin=faraway, normal=direction
+        )
+        extent = np.linalg.norm(closest_surface_point)
+        return extent
+
+    @property
+    @errors.alpha_quality
+    def bounds(self):
+        """
+        Return X Y bounds based on :any:`extent_in`.
+
+        Return:
+            6-sequence: lower X, upper X, lower Y, upper Y
+        """
+        return tuple(
+            np.sign(d.sum()) * self.extent_in(d) for d in [-X, X, -Y, Y]
+        )
+
+    @errors.alpha_quality
+    def closest_surface_point_to_plane(self, origin, normal):
+        """
+        Find the closest surface point to a plane around an ``origin`` that points
+        into the ``normal`` direction.
+
+        Args:
+            origin (3d vector): a point on the plane
+            normal (3d vector): normal vector of the plane
+
+        Returns:
+            3d vector : closest surface point
+        """
+        distance, plane_point = self.minimum_sdf_on_plane(
+            origin=origin, normal=normal, return_point=True
+        )
+        return self.surface_intersection(start=plane_point, direction=normal)
+
+    @errors.alpha_quality
+    def move_to_positive(self, direction=Y):
+        return self.translate(self.extent_in(-direction) * direction)
 
 
 def sdf2(f):
@@ -90,6 +402,11 @@ def _dot(a, b):
 
 def _vec(*arrs):
     return np.stack(arrs, axis=-1)
+
+def _perpendicular(v):
+    if all(v == 0):
+        raise ValueError("zero vector")
+    return np.array([-v[1], v[0]])
 
 
 _min = np.minimum
