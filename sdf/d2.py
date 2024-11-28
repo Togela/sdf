@@ -386,8 +386,8 @@ class SDF2:
             return points[indinside[np.random.choice(len(indinside), npoints)]]
     
     @errors.alpha_quality
-    def get_contour(self, step=None, bounds=None, samples=None, simplify=None, verbose=False):
-        cont = contours.generate(self, step, bounds, samples, simplify, verbose)
+    def get_contour(self, step=None, bounds=None, simplify=None, verbose=False):
+        cont = contours.generate(sdf=self, step=step, bounds=bounds, simplify=simplify, verbose=verbose)
         return cont
     
 def sdf2(f):
