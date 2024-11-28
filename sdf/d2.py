@@ -8,8 +8,9 @@ import time
 
 import scipy
 from scipy.linalg import LinAlgWarning
+from scipy.stats import qmc
 
-from . import dn, d3, ease, errors, util
+from . import dn, d3, ease, errors, util, contours
 
 # Constants
 
@@ -358,7 +359,37 @@ class SDF2:
     def move_to_positive(self, direction=Y):
         return self.translate(self.extent_in(-direction) * direction)
 
+    @errors.alpha_quality
+    def sample_points(self, npoints, radius):
+        bounds = self.bounds
+        dimensions = np.array((bounds[1] - bounds[0], bounds[3] - bounds[2]))
+        # center = np.array([bounds[0], bounds[2]]) + dimensions / 2
+        area = dimensions[0] * dimensions[1]
+        
+        radius_poisson = radius*(1/area)**0.5 # scale radius for poisson disk sampling range [0,1)
+        engine = qmc.PoissonDisk(d=2, 
+                                 radius=radius_poisson)
+        points_poisson = engine.fill_space()
 
+        points = points_poisson * dimensions + np.array([bounds[0], bounds[2]]) # transform sampled points to sdf bounds
+        
+        # find outside points
+        d = self.f(points)
+        indinside = np.where(d < -radius/2)[0]
+        
+        if len(indinside) < npoints:
+            warnings.warn(f"Could only sample {len(indinside)} of {npoints} points with radius {radius}."
+                        f"Consider changing radius.")
+            return points[indinside]
+
+        else:
+            return points[indinside[np.random.choice(len(indinside), npoints)]]
+    
+    @errors.alpha_quality
+    def get_contour(self, step=None, bounds=None, samples=None, simplify=None, verbose=False):
+        cont = contours.generate(self, step, bounds, samples, simplify, verbose)
+        return cont
+    
 def sdf2(f):
     @functools.wraps(f)
     def wrapper(*args, **kwargs):
