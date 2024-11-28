@@ -47,3 +47,29 @@ class Test2D(unittest.TestCase):
 
         [self.assertAlmostEqual(b, bc, places=5, msg=f"Bounds {bounds} differ from correct value {bounds_correct}") for b, bc in zip(bounds, bounds_correct)]
 
+    def test_sample_points(self):
+        rad = 1
+        cxy = [0, 0]
+        geo = circle(center=cxy, radius=rad)
+
+        mindist = 0.1
+        npoints = 100000
+        points = geo.sample_points(npoints, mindist)
+        
+
+        import matplotlib.pyplot as plt
+        from matplotlib.collections import PatchCollection
+        fig, ax = plt.subplots()
+        _ = ax.scatter(points[:, 0], points[:, 1])
+        circles = [plt.Circle((xi, yi), radius=mindist/2, fill=False)
+                for xi, yi in points]
+        collection = PatchCollection(circles, match_original=True)
+        ax.add_collection(collection)
+        _ = ax.set(aspect='equal', xlabel=r'$x_1$', ylabel=r'$x_2$',
+                xlim=[-rad*1.1, rad*1.1], ylim=[-rad*1.1, rad*1.1])
+        ax.add_artist(plt.Circle(cxy, radius=rad, fill=False))
+        plt.show(block=True)
+
+        dist = geo(points)
+        # plt.scatter(points[:,0], points[:,1]);plt.gca().set_aspect("equal");plt.show(block=True)
+        [self.assertLess(d, 0) for d in dist]
